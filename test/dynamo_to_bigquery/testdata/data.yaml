@@ -1,0 +1,9 @@
+projects:
+  - id: test
+    datasets:
+      - id: dataset1
+        tables:
+          - id: test
+            columns:
+              - name: id
+                type: STRING

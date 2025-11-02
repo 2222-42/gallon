@@ -21,6 +21,7 @@ type InputPluginSql struct {
 	client    *sql.DB
 	tableName string
 	driver    string
+	pageSize  int
 	serialize func(orderedmap.OrderedMap[string, any]) (GallonRecord, error)
 }
 
@@ -28,12 +29,14 @@ func NewInputPluginSql(
 	client *sql.DB,
 	tableName string,
 	driver string,
+	pageSize int,
 	serialize func(orderedmap.OrderedMap[string, any]) (GallonRecord, error),
 ) *InputPluginSql {
 	return &InputPluginSql{
 		client:    client,
 		tableName: tableName,
 		driver:    driver,
+		pageSize:  pageSize,
 		serialize: serialize,
 	}
 }
@@ -42,6 +45,10 @@ var _ InputPlugin = &InputPluginSql{}
 
 func (p *InputPluginSql) ReplaceLogger(logger logr.Logger) {
 	p.logger = logger
+}
+
+func (p *InputPluginSql) Cleanup() error {
+	return p.client.Close()
 }
 
 func (p *InputPluginSql) Extract(
@@ -57,13 +64,15 @@ func (p *InputPluginSql) Extract(
 	pagedQueryStatement := ""
 	if p.driver == "mysql" {
 		pagedQueryStatement = fmt.Sprintf(
-			"SELECT * FROM %v LIMIT 100 OFFSET ?",
+			"SELECT * FROM %v LIMIT %d OFFSET ?",
 			p.tableName,
+			p.pageSize,
 		)
 	} else if p.driver == "postgres" {
 		pagedQueryStatement = fmt.Sprintf(
-			"SELECT * FROM %v LIMIT 100 OFFSET $1",
+			"SELECT * FROM %v LIMIT %d OFFSET $1",
 			p.tableName,
+			p.pageSize,
 		)
 	} else {
 		return fmt.Errorf("unsupported driver: %v", p.driver)
@@ -85,7 +94,7 @@ loop:
 		case <-ctx.Done():
 			break loop
 		default:
-			rows, err := query.Query(page * 100)
+			rows, err := query.Query(page * p.pageSize)
 			if err != nil {
 				return err
 			}
@@ -145,16 +154,60 @@ loop:
 	return nil
 }
 
+func (p *InputPluginSql) CloseConnection() error {
+	return p.client.Close()
+}
+
 type InputPluginSqlConfig struct {
 	Table       string                                                          `yaml:"table"`
 	DatabaseUrl string                                                          `yaml:"database_url"`
 	Driver      string                                                          `yaml:"driver"`
+	PageSize    int                                                             `yaml:"pageSize"`
 	Schema      orderedmap.OrderedMap[string, InputPluginSqlConfigSchemaColumn] `yaml:"schema"`
 }
 
 type InputPluginSqlConfigSchemaColumn struct {
+	Type       string                                      `yaml:"type"`
+	Transforms []InputPluginSqlConfigSchemaColumnTransform `yaml:"transforms"`
+	Rename     *string                                     `yaml:"rename"`
+}
+
+type InputPluginSqlConfigSchemaColumnTransform struct {
+	// Operation: type conversion
 	Type   string  `yaml:"type"`
 	Format *string `yaml:"format"`
+	As     *string `yaml:"as"`
+}
+
+func (c InputPluginSqlConfigSchemaColumnTransform) Transform(sourceType string, value any) (any, error) {
+	switch sourceType {
+	case "time":
+		v, ok := value.(time.Time)
+		if !ok {
+			return nil, fmt.Errorf("value is not time: %v", value)
+		}
+
+		if c.Type == "string" {
+			if c.Format != nil {
+				return v.Format(*c.Format), nil
+			}
+
+			return v.Format(time.RFC3339), nil
+		}
+	case "int":
+		v, ok := value.(int64)
+		if !ok {
+			return nil, fmt.Errorf("value is not int: %v", value)
+		}
+
+		if c.Type == "time" {
+			if c.As == nil || *c.As == "unix" {
+				return time.Unix(v, 0), nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("unsupported transform: %v -> %v", sourceType, c.Type)
 }
 
 func (c InputPluginSqlConfigSchemaColumn) getValue(value any) (any, error) {
@@ -222,16 +275,28 @@ func (c InputPluginSqlConfigSchemaColumn) getValue(value any) (any, error) {
 		default:
 			return nil, fmt.Errorf("value is not bool: %v", value)
 		}
+	case "date":
+		b, ok := value.([]byte)
+		if ok {
+			v, err := time.Parse("2006-01-02", string(b))
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse date: %v", err)
+			}
+
+			return v.Format(time.DateOnly), nil
+		}
+
+		v, ok := value.(time.Time)
+		if !ok {
+			return nil, fmt.Errorf("value is not date: %v", value)
+		}
+
+		return v.Format(time.DateOnly), nil
 	case "time":
 		// when parseTime not specified, mysql returns []byte
 		b, ok := value.([]byte)
 		if ok {
-			format := "2006-01-02 15:04:05"
-			if c.Format != nil {
-				format = *c.Format
-			}
-
-			v, err := time.Parse(format, string(b))
+			v, err := time.Parse("2006-01-02 15:04:05", string(b))
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse time: %v", err)
 			}
@@ -269,6 +334,9 @@ func NewInputPluginSqlFromConfig(configYml []byte) (*InputPluginSql, error) {
 	}
 
 	dbConfig := inConfig.In
+	if dbConfig.PageSize == 0 {
+		dbConfig.PageSize = 1000
+	}
 
 	db, err := sql.Open(dbConfig.Driver, dbConfig.DatabaseUrl)
 	if err != nil {
@@ -282,6 +350,7 @@ func NewInputPluginSqlFromConfig(configYml []byte) (*InputPluginSql, error) {
 		db,
 		dbConfig.Table,
 		dbConfig.Driver,
+		dbConfig.PageSize,
 		func(item orderedmap.OrderedMap[string, any]) (GallonRecord, error) {
 			record := NewGallonRecord()
 
@@ -296,7 +365,23 @@ func NewInputPluginSqlFromConfig(configYml []byte) (*InputPluginSql, error) {
 					return GallonRecord{}, errors.Join(err, fmt.Errorf("failed to get value for column: %v", pair.Key))
 				}
 
-				record.Set(pair.Key, v)
+				sourceType := pair.Value.Type
+
+				for _, transform := range pair.Value.Transforms {
+					v, err = transform.Transform(sourceType, v)
+					if err != nil {
+						return GallonRecord{}, errors.Join(err, fmt.Errorf("failed to transform value for column: %v", pair.Key))
+					}
+
+					sourceType = transform.Type
+				}
+
+				columnName := pair.Key
+				if pair.Value.Rename != nil {
+					columnName = *pair.Value.Rename
+				}
+
+				record.Set(columnName, v)
 			}
 
 			return record, nil

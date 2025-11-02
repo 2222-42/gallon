@@ -143,6 +143,16 @@ if err := g.Run(); err != nil {
 }
 ```
 
+You can also use `gallon.RunGallonWithOptions` to run Gallon with options.
+
+```go
+gallon.RunGallonWithOptions(configYml, gallon.RunGallonOptions{
+    AsTemplate: true,
+    WithEnv:    true,
+    Logger:     zapr.NewLogger(zap.L()),
+})
+```
+
 ## Plugin Configurations for YAML
 
 ### DynamoDB Input Plugin
@@ -152,16 +162,20 @@ in:
   type: dynamodb
   region: ap-northeast-1
   table: users
+  pageSize: 1000
   endpoint: "http://localhost:8000"
   schema:
     id:
       type: string
     name:
       type: string
+      rename: user_name
     age:
       type: number
+      rename: user_age
     created_at:
       type: number
+      rename: created_timestamp
     profile:
       type: object
       properties:
@@ -180,8 +194,10 @@ in:
 - region: Your AWS Region
 - table: Your DynamoDB Table name
 - endpoint: for dynamodb-local (optional)
+- pageSize: Number of records per page (optional, default: 1000)
 - schema
   - type: `string`, `number`, `boolean`, `object`, `array`, `any` are supported
+  - rename: Change column name (optional)
   - properties: for `object` type, define nested fields in `properties` properties
   - items: for `array` type, define item type in `items` properties
 
@@ -192,6 +208,7 @@ in:
   type: sql
   driver: mysql
   table: users
+  pageSize: 1000
   database_url: user:password@tcp(localhost:3306)/dbname
   schema:
     id:
@@ -204,13 +221,27 @@ in:
       type: int
     birthday:
       type: time
-      format: "2006-01-02 15:04:05"
+    join_date:
+      type: date
     has_partner:
       type: bool
     balance:
       type: decimal
     preferences:
       type: json
+    old_column_name:
+      type: string
+      rename: new_column_name
+    unix_timestamp:
+      type: int
+      transforms:
+        - type: time
+          as: unix
+    created_at:
+      type: time
+      transforms:
+        - type: string
+          format: "2006-01-02 15:04:05"
 ```
 
 - driver: `mysql`, `postgres` are supported
@@ -219,9 +250,17 @@ in:
 - table: Table name
 - database_url: Database URL. This will be passed to `sql.Open` with the driver name.
   - For MySQL, it should be `user:password@tcp(host:port)/dbname` (See: [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql#dsn-data-source-name))
+- pageSize: Number of records per page (optional, default: 1000)
 - schema
-  - type: `string`, `int`, `float`, `decimal`, `time`, `bool`, `json` are supported. NULL are always acceptable.
-  - format: for `time` type. Specify time format string in [Go time layout](https://pkg.go.dev/time#Layout). Default is `2006-01-02 15:04:05`. (optional)
+  - type: `string`, `int`, `float`, `decimal`, `time`, `date`, `bool`, `json` are supported. NULL are always acceptable.
+    - `date`: Returns YYYY-MM-DD formatted string. If you want to return time.Time object, specify `time` type.
+  - rename: Change column name.
+  - transforms: Change column value type.
+    - type: Change type to `string`, `time`.
+    - format: Format for type conversion. The following formats are supported.
+      - For `time`, you can specify Go time format string (e.g. `2006-01-02 15:04:05`)
+    - as: Convert method for type conversion. The following methods are supported.
+      - For `int` type, you can specify `unix` to interpret as Unix timestamp.
 
 ### Random Input Plugin
 

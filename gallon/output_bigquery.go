@@ -63,6 +63,10 @@ func (p *OutputPluginBigQuery) ReplaceLogger(logger logr.Logger) {
 	p.logger = logger
 }
 
+func (p *OutputPluginBigQuery) Cleanup() error {
+	return p.client.Close()
+}
+
 func (p *OutputPluginBigQuery) waitUntilTableCreation(ctx context.Context, tableId string) error {
 	timeout := time.After(300 * time.Second)
 	ticker := time.NewTicker(10 * time.Second)
@@ -255,7 +259,7 @@ func NewOutputPluginBigQueryFromConfig(configYml []byte) (*OutputPluginBigQuery,
 	options := []option.ClientOption{}
 
 	if config.Endpoint != nil {
-		options = append(options, option.WithEndpoint(*config.Endpoint))
+		options = append(options, option.WithEndpoint(*config.Endpoint), option.WithoutAuthentication())
 	}
 
 	client, err := bigquery.NewClient(context.Background(), config.ProjectId, options...)
@@ -293,16 +297,20 @@ func NewOutputPluginBigQueryFromConfig(configYml []byte) (*OutputPluginBigQuery,
 						values = append(values, nil)
 						continue
 					}
+
 					recordValue, err := deserializeRecord(value.(map[string]any), v.Schema)
 					if err != nil {
 						return nil, err
 					}
+
 					values = append(values, recordValue)
 				} else if v.Type == bigquery.StringFieldType {
 					// If the field is a string, and the value is a JSON object, we need to deserialize it
 					switch value.(type) {
 					case string:
 						values = append(values, value)
+					case nil:
+						values = append(values, nil)
 					default:
 						jsonBytes, err := json.Marshal(value)
 						if err != nil {
@@ -321,22 +329,22 @@ func NewOutputPluginBigQueryFromConfig(configYml []byte) (*OutputPluginBigQuery,
 	), nil
 }
 
-func deserializeRecord(data map[string]any, schema bigquery.Schema) ([]bigquery.Value, error) {
-	values := []bigquery.Value{}
+func deserializeRecord(data map[string]any, schema bigquery.Schema) (map[string]bigquery.Value, error) {
+	values := map[string]bigquery.Value{}
 	for _, field := range schema {
 		value := data[field.Name]
 		if field.Type == bigquery.RecordFieldType {
 			if value == nil {
-				values = append(values, nil)
+				values[field.Name] = nil
 				continue
 			}
 			recordValue, err := deserializeRecord(value.(map[string]any), field.Schema)
 			if err != nil {
 				return nil, err
 			}
-			values = append(values, recordValue)
+			values[field.Name] = recordValue
 		} else {
-			values = append(values, value)
+			values[field.Name] = value
 		}
 	}
 	return values, nil
